@@ -6,18 +6,17 @@ package mr
 // remember to capitalize all names.
 //
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
+type GetTaskArgs struct {
 }
 
-type ExampleReply struct {
-	Y int
+type GetTaskReply struct {
+	Task Task
 }
 
-// Add your RPC definitions here.
+type ReportTaskArgs struct {
+	TaskID   int
+	TaskType TaskType
+}
 
+type ReportTaskReply struct {
+}
