@@ -7,7 +7,6 @@ package raft
 // In addition,  Make() creates a new raft peer that implements the
 // raft interface.
 
-
 import (
 	//	"bytes"
 	"math/rand"
@@ -17,9 +16,19 @@ import (
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
+type LogEntry struct {
+	Term int
+	Command interface{}
+}
+
+const (
+	Follower = iota
+	Candidate
+	Leader
+)
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -31,17 +40,28 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	currentTerm int
+	votedFor    int
+	log         []LogEntry
 
+	commitIndex int
+	lastApplied int
+	nextIndex   []int
+	matchIndex  []int
+
+	state               int
+	electionResetTime   time.Time
+	heartbeatInterval   time.Duration
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
 	// Your code here (3A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentTerm, rf.state == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -105,17 +125,95 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	Term        int
+	VoteGranted bool
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) lastLogIndexAndTerm() (int, int) {
+	lastIndex := len(rf.log) - 1
+	lastTerm := rf.log[lastIndex].Term
+	return lastIndex, lastTerm
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		rf.state = Follower
+	}
+
+	reply.Term = rf.currentTerm
+
+	myLastIndex, myLastTerm := rf.lastLogIndexAndTerm()
+	upToDate := args.LastLogTerm > myLastTerm ||
+		(args.LastLogTerm == myLastTerm && args.LastLogIndex >= myLastIndex)
+
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && upToDate {
+		rf.votedFor = args.CandidateId
+		rf.electionResetTime = time.Now()
+		reply.VoteGranted = true
+	}
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	reply.Success = false
+
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	}
+
+	rf.state = Follower
+	rf.electionResetTime = time.Now()
+	reply.Term = rf.currentTerm
+
+	// For 3A heartbeat handling, this is enough.
+	// We're not doing full log consistency yet.
+	reply.Success = true
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -150,6 +248,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	return rf.peers[server].Call("Raft.AppendEntries", args, reply)
+}
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -163,27 +264,166 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	term := rf.currentTerm
+	isLeader := rf.state == Leader
+	if !isLeader {
+		return -1, term, false
+	}
 
-	return index, term, isLeader
+	// Not really needed for 3A, but safe to leave.
+	rf.log = append(rf.log, LogEntry{
+		Term:    rf.currentTerm,
+		Command: command,
+	})
+	index := len(rf.log) - 1
+
+	return index, term, true
+}
+
+func (rf *Raft) startElection() {
+	rf.mu.Lock()
+
+	rf.state = Candidate
+	rf.currentTerm++
+	termStarted := rf.currentTerm
+	rf.votedFor = rf.me
+	rf.electionResetTime = time.Now()
+
+	lastLogIndex, lastLogTerm := rf.lastLogIndexAndTerm()
+	votes := 1
+	majority := len(rf.peers)/2 + 1
+
+	rf.mu.Unlock()
+
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+
+		go func(server int) {
+			args := &RequestVoteArgs{
+				Term:         termStarted,
+				CandidateId:  rf.me,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
+			}
+			reply := &RequestVoteReply{}
+
+			ok := rf.sendRequestVote(server, args, reply)
+			if !ok {
+				return
+			}
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			if rf.state != Candidate || rf.currentTerm != termStarted {
+				return
+			}
+
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.state = Follower
+				rf.votedFor = -1
+				rf.electionResetTime = time.Now()
+				return
+			}
+
+			if reply.VoteGranted {
+				votes++
+				if votes >= majority && rf.state == Candidate {
+					rf.state = Leader
+
+					for i := range rf.peers {
+						rf.nextIndex[i] = len(rf.log)
+						rf.matchIndex[i] = 0
+					}
+
+					go rf.leaderHeartbeatLoop()
+				}
+			}
+		}(i)
+	}
+}
+
+func (rf *Raft) leaderHeartbeatLoop() {
+	for {
+		rf.mu.Lock()
+		if rf.state != Leader {
+			rf.mu.Unlock()
+			return
+		}
+
+		term := rf.currentTerm
+		rf.mu.Unlock()
+
+		for i := range rf.peers {
+			if i == rf.me {
+				continue
+			}
+
+			go func(server int) {
+				rf.mu.Lock()
+				prevLogIndex := len(rf.log) - 1
+				prevLogTerm := rf.log[prevLogIndex].Term
+				rf.mu.Unlock()
+
+				args := &AppendEntriesArgs{
+					Term:         term,
+					LeaderId:     rf.me,
+					PrevLogIndex: prevLogIndex,
+					PrevLogTerm:  prevLogTerm,
+					Entries:      nil, // heartbeat
+					LeaderCommit: 0,
+				}
+				reply := &AppendEntriesReply{}
+
+				ok := rf.sendAppendEntries(server, args, reply)
+				if !ok {
+					return
+				}
+
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+
+				if rf.state != Leader || rf.currentTerm != term {
+					return
+				}
+
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.state = Follower
+					rf.votedFor = -1
+					rf.electionResetTime = time.Now()
+					return
+				}
+			}(i)
+		}
+
+		time.Sleep(rf.heartbeatInterval)
+	}
 }
 
 func (rf *Raft) ticker() {
 	for true {
-
 		// Your code here (3A)
 		// Check if a leader election should be started.
+		timeout := time.Duration(400+rand.Intn(250)) * time.Millisecond
 
+		rf.mu.Lock()
+		state := rf.state
+		elapsed := time.Since(rf.electionResetTime)
+		rf.mu.Unlock()
 
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		if state != Leader && elapsed >= timeout {
+			rf.startElection()
+		}
+
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -204,6 +444,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.log = []LogEntry{{Term: 0, Command: nil}}
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = 1
+		rf.matchIndex[i] = 0
+	}
+
+	rf.state = Follower
+	rf.electionResetTime = time.Now()
+	rf.heartbeatInterval = 100 * time.Millisecond
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
