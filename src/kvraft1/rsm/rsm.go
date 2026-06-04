@@ -74,6 +74,10 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		rsm.sm.Restore(snapshot)
+	}
 	go rsm.reader()
 	return rsm
 }
@@ -125,7 +129,8 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 
 // reader is the sole consumer of applyCh. It applies every committed
 // entry to the state machine in log order, then wakes the matching
-// Submit (if any) on this server.
+// Submit (if any) on this server. Snapshots are taken inline so the
+// index passed to rf.Snapshot always matches the applied state exactly.
 func (rsm *RSM) reader() {
 	for msg := range rsm.applyCh {
 		switch {
@@ -135,6 +140,11 @@ func (rsm *RSM) reader() {
 			op := msg.Command.(Op)
 			rep := rsm.sm.DoOp(op.Req)
 			rsm.wake(msg.CommandIndex, op, rep)
+			if rsm.maxraftstate != -1 && rsm.rf.PersistBytes() >= rsm.maxraftstate {
+				if snapshot := rsm.sm.Snapshot(); snapshot != nil {
+					rsm.rf.Snapshot(msg.CommandIndex, snapshot)
+				}
+			}
 		}
 	}
 	rsm.wakeAll() // applyCh closed on shutdown
